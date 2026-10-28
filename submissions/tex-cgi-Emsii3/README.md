@@ -99,28 +99,38 @@ DATABASE_URL=postgres://user:pass@host:5432/feed JWT_SECRET=million-users-challe
 
 ## Measured (not on the benchmark boxes)
 
-A MacBook with 10 cores (so `MAX_CHILDREN` = 40), Postgres 18 on the same machine, `hey` on the same machine,
-fresh copy of the seed database, 8 s per run, all responses 200 (`/like` returns 200 for an already-liked post
-and 201 for the first like). Requests per second, with p95 latency in brackets:
+An `ubuntu:24.04` container (Docker Desktop, 10 cores, so `MAX_CHILDREN` = 40) with the packages from
+`install.sh`, Postgres 18 in a second container, `ab -k` in the same container as the server, a fresh copy
+of the seed database, 8 s per run, no non-2xx responses (`/like` returns 201 for the first like and 200 after
+that). Requests per second, with p95 latency in brackets, for the per-request directories on tmpfs
+(`/dev/shm`, the default when `TMPDIR` is unset, as on the benchmark box) and on disk (`TMPDIR=/var/tmp/...`,
+overlayfs):
 
-| Concurrency | `GET /feed` | `GET /posts/1` | `POST /posts/2/like` (authed) |
+| Concurrency | Endpoint | `/dev/shm` (default) | disk |
 |---|---|---|---|
-| 1 | 15 req/s (82 ms) | 16 req/s (77 ms) | 14 req/s (78 ms) |
-| 8 | 79 req/s (117 ms) | 75 req/s (152 ms) | 72 req/s (126 ms) |
-| 40 | 88 req/s (578 ms) | 93 req/s (567 ms) | 78 req/s (653 ms) |
+| 1 | `GET /feed` | 80 req/s (13 ms) | 71 req/s (16 ms) |
+| 1 | `GET /posts/1` | 99 req/s (11 ms) | 91 req/s (13 ms) |
+| 1 | `POST /posts/2/like` (authed) | 42 req/s (25 ms) | 41 req/s (26 ms) |
+| 8 | `GET /feed` | 401 req/s (25 ms) | 396 req/s (24 ms) |
+| 8 | `GET /posts/1` | 466 req/s (21 ms) | 412 req/s (25 ms) |
+| 8 | `POST /posts/2/like` (authed) | 198 req/s (46 ms) | 159 req/s (73 ms) |
+| 32 | `GET /feed` | 437 req/s (113 ms) | 355 req/s (147 ms) |
+| 32 | `GET /posts/1` | 529 req/s (94 ms) | 451 req/s (116 ms) |
+| 32 | `POST /posts/2/like` (authed) | 213 req/s (240 ms) | 192 req/s (282 ms) |
 
-So about 65 to 70 ms per request when idle (process start, format load, HMAC in macros, a new
-Postgres connection, query, exit), and a ceiling around 80 to 90 req/s on 10 cores once they are all busy
-spawning `pdftex`. A million users at one page per 24 s want about 42,000 req/s, which is roughly 500 times
-what this does. Expect it to hold on the order of 2,000 users before p95 passes 500 ms, and that is a guess
-from the numbers above, not a measurement. The 16-core number on the real box will be somewhat higher and
-the 4-core number lower, and all of them will be small.
+So about 10 to 12 ms per read request when idle (process start, format load, HMAC in macros, a new
+Postgres connection, query, exit) and a ceiling around 450 to 530 req/s on 10 cores once they are all busy
+spawning `pdftex`. Likes are about half that, because each one waits for its commit. tmpfs is worth 5 to 20%:
+the files are a few hundred bytes and live in the page cache either way, so the cost is process creation,
+the format load and the Postgres connection setup.
 
-The cost is spread over process creation, the format load and the Postgres connection setup, and there is
-no cheap fix inside this design: the point of the design is the process per request. Moving the work out of
-TeX would make it fast and defeat the submission.
+A million users at one page per 24 s want about 42,000 req/s, roughly 80 times what this does. Expect it to
+hold on the order of 10,000 users, and that is a guess from the numbers above, not a measurement. The
+16-core number on the real box will be somewhat higher and the 4-core number lower.
 
-On Linux the numbers should differ (`fork`+`exec` is cheaper, `/dev/shm` is real memory, and a loopback
-Postgres connection is cheaper to open). The test suite also passes (`passed=42 failed=0`) in an
-`ubuntu:24.04` container with the packages from `install.sh` (pdfTeX 1.40.25, TeX Live 2023/Debian) against
-a `postgres:18` container, the same setup as CI.
+There is no cheap fix inside this design: the point of the design is the process per request. Moving the work
+out of TeX would make it fast and defeat the submission.
+
+The same setup also passes the test suite (`passed=42 failed=0`; pdfTeX 1.40.25, TeX Live 2023/Debian), as
+does macOS with TeX Live 2026. On macOS the process per request is 5 to 6 times slower (about 15 req/s at
+concurrency 1, 80 to 90 req/s at most on the same 10 cores), because `fork`+`exec` costs much more there.
