@@ -1,8 +1,18 @@
 % feed.tex -- the whole application of the feed API, in plain e-TeX (pdfTeX -ini -etex -8bit).
 %
-% One pdftex process per request, started from a precompiled format (see build-fmt.tex).  The host has put
-% meta.txt / req.txt / body.txt in the current directory; \feedmain parses the request, verifies the JWT
-% (crypto: sha256.tex), parses the JSON body, sends one database command through db.req / db.resp and writes resp.txt (status line, JSON line).
+% A long-lived worker: pdftex is started once from a precompiled format (see build-fmt.tex) with
+% '\def\feedctl{<control dir>/}\feedloop'.  \feedloop reads one line at a time from the FIFO <control dir>/job.fifo;
+% the line is a path prefix P ("" when the host's working directory for this worker is the request directory).
+% The host has put P meta.txt / P req.txt / P body.txt in place.  \feed@serve parses the request, verifies the JWT
+% (crypto: sha256.tex), parses the JSON body, sends one database command through P db.req / P db.resp and writes
+% P resp.txt (status line, JSON line); \feed@respond then writes "ok" to <control dir>/done.fifo and unwinds to
+% the loop.  Nothing is kept between requests: see "Isolation" below.
+%
+% Isolation: a request runs inside \begingroup...\endgroup, so every local assignment (registers, macros) is undone
+% when it ends.  The few global assignments (\hmacresult, \bdecoded, \sharesult, \ifbvalid, \feed@jerr,
+% \feed@bcnt, \feed@auth, \feed@T:*, \feed@V:*) are reset by \feed@scrub before and after every request.  No
+% control sequence name is created from request data (\csname is only used with names that exist or from a
+% fixed set), so the hash table does not grow.
 %
 % Conventions:
 %  * Request data are strings of catcode-12 characters (spaces: catcode 10).
@@ -29,6 +39,9 @@
 \chardef\feed@pd=4
 \chardef\feed@wd=5
 \chardef\feed@qd=6
+\chardef\feed@jb=7
+\chardef\feed@dn=8
+\def\feed@pre{}   % path prefix of the current request (the line read from the job FIFO)
 
 \countdef\feed@c=200   \countdef\feed@d=201   \countdef\feed@cnt=202  \countdef\feed@i=203
 \countdef\feed@trim=204 \countdef\feed@pn=205 \countdef\feed@over=206 \countdef\feed@hi=207
@@ -332,7 +345,8 @@
   \fi}
 \def\feed@wanted#1{\expandafter\def\csname feed@w:#1\endcsname{}}
 \feed@wanted{alg}\feed@wanted{sub}\feed@wanted{username}\feed@wanted{exp}\feed@wanted{body}
-\def\feed@clr#1{\expandafter\global\expandafter\let\csname feed@T:#1\endcsname\relax}
+\def\feed@clr#1{\expandafter\global\expandafter\let\csname feed@T:#1\endcsname\relax
+  \expandafter\global\expandafter\let\csname feed@V:#1\endcsname\feed@empty}
 \def\feed@clrall{\feed@clr{alg}\feed@clr{sub}\feed@clr{username}\feed@clr{exp}\feed@clr{body}}
 
 % run the parser on macro \feed@in (S-form incl. trailing sentinel-less); sets \feed@jerr
@@ -360,11 +374,12 @@
 
 % ---------------------------------------------------------------- output
 \def\feed@respond#1#2{%
-  \immediate\openout\feed@wd=resp.txt\relax
+  \immediate\openout\feed@wd=\feed@pre resp.txt\relax
   \immediate\write\feed@wd{#1}%
   \immediate\write\feed@wd{#2}%
   \immediate\closeout\feed@wd
-  \end}
+  \feed@signal
+  \feed@abort}
 \def\feed@err#1#2{\feed@respond{#1}{\feed@LB"error":"#2"\feed@RB}}
 \def\feed@notfound{\feed@err{404}{not found}}
 \def\feed@ise{\feed@err{500}{internal server error}}
@@ -372,7 +387,7 @@
 % ---------------------------------------------------------------- files
 \def\feed@rdline{\readline\feed@fh to \feed@line}
 \def\feed@readmeta{%
-  \openin\feed@fh=meta.txt\relax
+  \openin\feed@fh=\feed@pre meta.txt\relax
   \feed@rdline \let\feed@now\feed@line
   \feed@rdline \let\feed@start\feed@line
   \feed@rdline \let\feed@secret\feed@line
@@ -399,7 +414,7 @@
   \fi}
 \def\feed@readreq{%
   \let\feed@auth\feed@unset
-  \openin\feed@fh=req.txt\relax
+  \openin\feed@fh=\feed@pre req.txt\relax
   \feed@rdline
   \edef\feed@tmp{\feed@line\space\space}%
   \expandafter\feed@rq\feed@tmp\feed@end
@@ -414,7 +429,7 @@
     \expandafter\feed@bloopr
   \fi}
 \def\feed@readbody{%
-  \openin\feed@fh=body.txt\relax
+  \openin\feed@fh=\feed@pre body.txt\relax
   \ifeof\feed@fh\else\feed@bloopr\fi
   \closein\feed@fh}
 
@@ -426,7 +441,7 @@
   \else\edef\feed@curseg{\feed@curseg#1}\let\feed@n\feed@pp
   \fi\fi\fi\feed@n}
 \def\feed@ppstop#1\feed@end{}
-\def\feed@commit{\expandafter\let\csname feed@sg\number\feed@ns\endcsname\feed@curseg}
+\def\feed@commit{\ifnum\feed@ns<4 \expandafter\let\csname feed@sg\number\feed@ns\endcsname\feed@curseg\fi}
 \def\feed@pathsegs{%
   \feed@ns=0 \def\feed@curseg{}%
   \expandafter\feed@pp\feed@target\feed@end
@@ -435,10 +450,10 @@
 % ---------------------------------------------------------------- pgq
 \def\feed@pgq#1{%
   \feed@got=0 \feed@lines=0 \relax
-  \immediate\openout\feed@qd=db.req\relax
+  \immediate\openout\feed@qd=\feed@pre db.req\relax
   \immediate\write\feed@qd{#1}%
   \immediate\closeout\feed@qd
-  \openin\feed@pd=db.resp\relax
+  \openin\feed@pd=\feed@pre db.resp\relax
   \feed@prloop
   \closein\feed@pd}
 \def\feed@fld#1|#2|#3|#4|#5|#6|#7\feed@end{%
@@ -591,7 +606,7 @@
   \expandafter\ifx\csname feed@V:body\endcsname\feed@empty \feed@err{400}{body is required}\fi
   \ifnum\feed@bcnt>500 \feed@err{400}{body must be at most 500 characters}\fi
   \expandafter\let\expandafter\feed@body\csname feed@V:body\endcsname
-  \immediate\openout\feed@wd=newbody.txt\relax
+  \immediate\openout\feed@wd=\feed@pre newbody.txt\relax
   \immediate\write\feed@wd{\expandafter\feed@rawl\feed@body\feed@end}%
   \immediate\closeout\feed@wd
   \let\feed@onrow\feed@oncreate
@@ -645,8 +660,41 @@
     \ifnum\pdfstrcmp{\feed@seg1}{posts}=0 \ifnum\pdfstrcmp{\feed@seg3}{like}=0 \feed@like\fi\fi
   \fi}
 
-\def\feedmain{%
+% ---------------------------------------------------------------- the worker loop
+% Telling the host: TeX buffers \write output until the file is closed, so open, write, close every time.
+\def\feed@signal{%
+  \immediate\openout\feed@dn=\feedctl done.fifo\relax
+  \immediate\write\feed@dn{ok}%
+  \immediate\closeout\feed@dn}
+
+% Nothing may survive a request: scrub every global.
+\def\feed@scrub{%
+  \feed@clrall \gdef\feed@jerr{0}\gdef\feed@bcnt{0}\global\let\feed@auth\feed@unset
+  \gdef\hmacresult{}\gdef\bdecoded{}\gdef\sharesult{}\bvalidtrue}
+
+% \feed@respond ends the request by skipping everything up to \feed@reqend (the marker \feed@serve put after the
+% handler), then pops the conditionals the skipped \fi's belonged to, closes the groups and streams, and loops.
+\def\feed@reqend{}
+\long\def\feed@abort#1\feed@reqend{\closein\feed@fh \closein\feed@pd \feed@popifs}
+\def\feed@popifs{\ifnum\currentiflevel>1 \expandafter\feed@popone\else\expandafter\feed@popgroups\fi}
+\def\feed@popone{\fi\feed@popifs}
+\def\feed@popgroups{\ifnum\currentgrouplevel>0 \expandafter\feed@popgroup\else\expandafter\feed@done\fi}
+\def\feed@popgroup{\endgroup\feed@popgroups}
+\def\feed@done{\feed@scrub \feed@next}
+
+\def\feed@serve{%
+  \begingroup
+  \feed@scrub
   \feed@readmeta
   \feed@readreq
   \feed@route
-  \feed@notfound}
+  \feed@notfound
+  \feed@reqend}
+\def\feed@quit{\end}
+\def\feed@next{%
+  \readline\feed@jb to \feed@pre
+  \ifeof\feed@jb \expandafter\feed@quit \else \expandafter\feed@serve \fi}
+\def\feedloop{%
+  \tracingstats=1
+  \openin\feed@jb=\feedctl job.fifo\relax
+  \ifeof\feed@jb \expandafter\feed@quit \else \expandafter\feed@next \fi}

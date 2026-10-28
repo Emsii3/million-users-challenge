@@ -1,9 +1,17 @@
-/* host: a tiny HTTP/1.1 front for the TeX CGI handler (see PLAN Contract 1).
- * One poll() loop, two listening ports, keep-alive connections. Each complete request is written to a fresh temp
- * dir and handled by one `pdftex -fmt=feed '\feedmain'` process (at most MAX_CHILDREN at once, the rest queue).
- * The host knows no application logic: it frames HTTP, runs TeX, and relays resp.txt.
- * It also owns the database: a pool of persistent libpq connections driven from the same poll() loop. TeX talks to
- * it through two FIFOs in its request dir: it writes one command line to db.req and reads the answer from db.resp. */
+/* host: a tiny HTTP/1.1 front for the TeX handler (see PLAN Contract 1).
+ * One event loop (epoll on Linux, poll() elsewhere), two listening ports, keep-alive connections. Each complete
+ * request is handed to one of WORKERS long-lived `pdftex -fmt=feed '\feedloop'` processes (the rest queue); a worker
+ * handles one request at a time and is replaced after WORKER_MAX_REQUESTS of them.
+ * The host knows no application logic: it frames HTTP, feeds the workers, and relays resp.txt.
+ * It also owns the database: a pool of persistent libpq connections driven from the same loop. TeX talks to it
+ * through two FIFOs in the worker's directory: it writes one command line to db.req and reads the answer from db.resp.
+ *
+ * Worker protocol (everything lives in <workdir>/w<N>/, which is also the worker's cwd):
+ *   job.fifo   host -> TeX   one line per request: the path prefix of the request files ("" here, cwd is the dir)
+ *   done.fifo  TeX -> host   one line "ok" when resp.txt is complete (TeX opens, writes and closes it each time)
+ *   meta.txt req.txt body.txt  written by the host before the job line; newbody.txt resp.txt written by TeX;
+ *   db.req db.resp             fresh FIFOs per request, as before
+ * Closing job.fifo (EOF) makes the worker exit. */
 #define _GNU_SOURCE /* memmem, strcasestr on glibc */
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -13,7 +21,11 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#ifdef __linux__
+#include <sys/epoll.h>
+#else
 #include <poll.h>
+#endif
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,52 +46,159 @@
 
 #define MAX_BODY 16384
 #define MAX_HEAD 16384
+#define DEFAULT_RECYCLE 5000
 #define IDLE_SECS 120
-#define CHILD_SECS 30
+#define CHILD_SECS 30        /* a request that takes longer kills its worker */
+#define QUEUE_SECS 60        /* a request that waits longer for a worker gets a 500 */
 #define DB_QUEUE_SECS 10
 #define DB_CONNECT_MS 5000
 #define DB_QUERY_MS 45000
+#define DBLINE 1024
 #define BODY500 "{\"error\":\"internal server error\"}"
 
+typedef struct { int kind; void *obj; } evsrc;
+enum { EV_IN = 1, EV_OUT = 2, EV_ERR = 4 };
+typedef struct { evsrc *src; int ev; } evout;
+
 enum state { READING, QUEUED, RUNNING, WRITING };
+enum { K_SELF, K_LISTEN, K_CLIENT, K_REQ, K_RESP, K_DB, K_DONE };
 enum dbst { DB_NONE, DB_WAITLINE, DB_QUEUED, DB_INFLIGHT, DB_RESP, DB_DONE };
+enum wst { W_DOWN, W_IDLE, W_BUSY, W_RETIRING };
 
 struct dbc;
 
-typedef struct {
-  int fd;
+/* A client connection. Small on purpose: tens of thousands of idle keep-alive connections each cost this struct
+   and their socket, nothing else (the input buffer is freed whenever it is empty). */
+typedef struct conn {
+  evsrc src;                       /* event loop tag (kind K_CLIENT) */
+  int fd, evm;                     /* socket, interest mask currently registered */
+  size_t idx;                      /* position in conns[] */
+  struct conn *qnext;              /* run queue link */
   enum state st;
+  int close_after, dead;
   char *in; size_t inlen, incap;   /* unparsed input */
   size_t reqlen, hdrlen, clen;     /* current complete request: total bytes, header bytes (incl. CRLFCRLF), body bytes */
-  int close_after;
-  unsigned long seq;               /* FIFO ticket while QUEUED */
-  pid_t pid; char dir[PATH_MAX]; time_t started;
   char *out; size_t outlen, outpos;
-  time_t last;
-  int dead;
-  /* database side of the running child */
-  enum dbst dbst;
-  int reqfd, respfd, keepfd;       /* db.req (O_RDWR), db.resp writer, db.resp keeper reader */
-  char dbline[1024]; size_t dblen;
-  unsigned long dbseq; time_t dbqt;
-  struct dbc *dbc;
-  char *dout; size_t dlen, dpos;
+  time_t last;                     /* queued time while QUEUED, else last activity */
 } conn;
 
+/* A TeX worker process and everything about the request it is serving. */
+typedef struct worker {
+  int id; enum wst st;
+  pid_t pid; char *dir;
+  int jobfd, jobkeep, donefd;      /* job.fifo writer + a keeper reader (so TeX's open never blocks), done.fifo O_RDWR */
+  char dnbuf[16]; size_t dnlen;    /* done.fifo bytes read so far */
+  int64_t spawned_ms, retry_at;
+  time_t started;                  /* start of the current request (or of the retirement) */
+  int killed; unsigned long served;
+  conn *cur;
+  /* database side of the current request */
+  evsrc dsrc[3];                   /* tags for db.req, db.resp and done.fifo */
+  enum dbst dbst; int dwait;       /* dwait: db.resp registered for EV_OUT */
+  int reqfd, respfd, keepfd;       /* db.req (O_RDWR), db.resp writer, db.resp keeper reader */
+  char *dbline; size_t dblen;
+  time_t dbqt; struct worker *dbnext;
+  struct dbc *dbc;
+  char *dout; size_t dlen, dpos;
+} worker;
+
 static conn **conns; static size_t nconns, capconns;
-static int running, max_children, selfpipe[2];
-static unsigned long seqno;
+static conn **grave; static size_t ngrave, capgrave;   /* closed conns, freed at the end of the loop round */
+static conn *runq_head, *runq_tail;                    /* QUEUED conns, oldest first */
+static worker *workers; static int nworkers;
+static worker **idle; static int nidle;                /* idle workers, most recently used on top */
+static worker *dbq_head, *dbq_tail;                    /* workers with a database command waiting */
+static int selfpipe[2];
+static volatile sig_atomic_t stopping;
+static int keep_logs;                                  /* KEEP_WORKDIR=1: keep the TeX logs for debugging */
+static unsigned long logseq;
+static long recycle_after = DEFAULT_RECYCLE;
 static time_t start_time;
-static char tmpbase[PATH_MAX], fmtpath[PATH_MAX + 16];
+static char tmpbase[PATH_MAX], workdir[PATH_MAX + 32], fmtpath[PATH_MAX + 16];
 
 static void die(const char *m) { perror(m); exit(1); }
 
-static void on_chld(int s) { (void)s; int e = errno; char c = 0; if (write(selfpipe[1], &c, 1) < 0) {} errno = e; }
+static void wake(void) { int e = errno; char c = 0; if (write(selfpipe[1], &c, 1) < 0) {} errno = e; }
+static void on_chld(int s) { (void)s; wake(); }
+static void on_term(int s) { (void)s; stopping = 1; wake(); }
 
 static void set_nb_cloexec(int fd) {
   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
   fcntl(fd, F_SETFD, FD_CLOEXEC);
 }
+
+
+/* ---------- event loop backend: epoll on Linux, poll() elsewhere ---------- */
+/* ev_add/ev_mod/ev_del register an fd with an interest mask (EV_IN | EV_OUT) and an evsrc tag; ev_wait returns the
+   ready tags. Level triggered. EV_ERR is reported for hangups and errors whatever the mask. */
+
+#define EVMAX 512
+
+#ifdef __linux__
+static int epfd;
+static void ev_init(void) { epfd = epoll_create1(EPOLL_CLOEXEC); if (epfd < 0) die("epoll_create1"); }
+static int ev_ctl(int op, int fd, int ev, evsrc *s) {
+  struct epoll_event e; memset(&e, 0, sizeof e);
+  e.events = (ev & EV_IN ? EPOLLIN : 0) | (ev & EV_OUT ? EPOLLOUT : 0); e.data.ptr = s;
+  return epoll_ctl(epfd, op, fd, &e);
+}
+static int ev_add(int fd, int ev, evsrc *s) { return ev_ctl(EPOLL_CTL_ADD, fd, ev, s); }
+static int ev_mod(int fd, int ev, evsrc *s) { return ev_ctl(EPOLL_CTL_MOD, fd, ev, s); }
+static void ev_del(int fd) { epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL); }
+static int ev_wait(evout *out, int ms) {
+  struct epoll_event es[EVMAX];
+  int n = epoll_wait(epfd, es, EVMAX, ms);
+  if (n < 0) { if (errno != EINTR) die("epoll_wait"); return 0; }
+  for (int i = 0; i < n; i++) {
+    out[i].src = es[i].data.ptr; out[i].ev = 0;
+    if (es[i].events & EPOLLIN) out[i].ev |= EV_IN;
+    if (es[i].events & EPOLLOUT) out[i].ev |= EV_OUT;
+    if (es[i].events & (EPOLLHUP | EPOLLERR)) out[i].ev |= EV_ERR;
+  }
+  return n;
+}
+#else
+static struct pollfd *pf; static evsrc **psrc; static int *pidx; static size_t pn, pcap, pidxcap;
+static void ev_init(void) {}
+static int ev_add(int fd, int ev, evsrc *s) {
+  if ((size_t)fd >= pidxcap) {
+    size_t nc = (size_t)fd * 2 + 64; pidx = realloc(pidx, nc * sizeof *pidx);
+    for (size_t i = pidxcap; i < nc; i++) pidx[i] = -1;
+    pidxcap = nc;
+  }
+  if (pidx[fd] >= 0) return -1;
+  if (pn == pcap) { pcap = pcap ? pcap * 2 : 256; pf = realloc(pf, pcap * sizeof *pf); psrc = realloc(psrc, pcap * sizeof *psrc); }
+  pf[pn].fd = fd; pf[pn].events = (ev & EV_IN ? POLLIN : 0) | (ev & EV_OUT ? POLLOUT : 0); pf[pn].revents = 0;
+  psrc[pn] = s; pidx[fd] = (int)pn++;
+  return 0;
+}
+static int ev_mod(int fd, int ev, evsrc *s) {
+  if ((size_t)fd >= pidxcap || pidx[fd] < 0) return -1;
+  int i = pidx[fd]; pf[i].events = (ev & EV_IN ? POLLIN : 0) | (ev & EV_OUT ? POLLOUT : 0); psrc[i] = s;
+  return 0;
+}
+static void ev_del(int fd) {
+  if (fd < 0 || (size_t)fd >= pidxcap || pidx[fd] < 0) return;
+  int i = pidx[fd]; pidx[fd] = -1; pn--;
+  if ((size_t)i != pn) { pf[i] = pf[pn]; psrc[i] = psrc[pn]; pidx[pf[i].fd] = i; }
+}
+static int ev_wait(evout *out, int ms) {
+  int r = poll(pf, pn, ms), n = 0;
+  if (r < 0) { if (errno != EINTR) die("poll"); return 0; }
+  for (size_t i = 0; i < pn && n < EVMAX && r > 0; i++) {
+    short re = pf[i].revents; if (!re) continue;
+    r--; out[n].src = psrc[i]; out[n].ev = 0;
+    if (re & POLLIN) out[n].ev |= EV_IN;
+    if (re & POLLOUT) out[n].ev |= EV_OUT;
+    if (re & (POLLHUP | POLLERR | POLLNVAL)) out[n].ev |= EV_ERR;
+    n++;
+  }
+  return n;
+}
+#endif
+/* Unregisters before closing: a forked child may still hold a dup of the fd for a moment, which would keep an epoll
+   registration (and its stale tag) alive after close(). */
+static void ev_close(int fd) { if (fd >= 0) { ev_del(fd); close(fd); } }
 
 /* ---------- paths ---------- */
 
@@ -104,31 +223,43 @@ static void find_paths(const char *argv0) {
 
 /* ---------- connections ---------- */
 
-static void close_conn(conn *c) {
-  if (c->fd >= 0) close(c->fd);
-  c->fd = -1; c->dead = 1;
+/* Sets the interest mask of the client socket from its state: READING listens, WRITING waits for room, the rest
+   (QUEUED, RUNNING) only watches for errors, so a pipelined request is not read before the current one is answered. */
+static void conn_set(conn *c, enum state st) {
+  c->st = st;
+  if (c->fd < 0) return;
+  int want = st == READING ? EV_IN : st == WRITING ? EV_OUT : 0;
+  if (want != c->evm) { ev_mod(c->fd, want, &c->src); c->evm = want; }
 }
 
-static void compact(void) {
-  size_t j = 0;
-  for (size_t i = 0; i < nconns; i++) {
-    if (conns[i]->dead) { free(conns[i]->in); free(conns[i]->out); free(conns[i]); }
-    else conns[j++] = conns[i];
-  }
-  nconns = j;
+static void conn_free(conn *c) { free(c->in); free(c->out); free(c); }
+
+/* Closes the socket and forgets the conn. If the run queue or a child still points at it, whoever does
+   (dispatch / finish) frees it; otherwise it is freed at the end of this loop round (events of this round may
+   still carry its tag). */
+static void close_conn(conn *c) {
+  if (c->dead) return;
+  ev_close(c->fd); c->fd = -1; c->dead = 1;
+  conns[c->idx] = conns[--nconns]; conns[c->idx]->idx = c->idx;
+  if (c->st == QUEUED || c->st == RUNNING) return;   /* the run queue / the worker frees it */
+  if (ngrave == capgrave) grave = realloc(grave, (capgrave = capgrave ? capgrave * 2 : 64) * sizeof *grave);
+  grave[ngrave++] = c;
 }
+
+static void empty_grave(void) { while (ngrave) conn_free(grave[--ngrave]); }
 
 static void accept_on(int lfd) {
-  for (;;) {
+  for (int i = 0; i < 1024; i++) {
     int fd = accept(lfd, NULL, NULL);
     if (fd < 0) return; /* EAGAIN, or transient (EMFILE...): try again next round */
     set_nb_cloexec(fd);
     int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     conn *c = calloc(1, sizeof *c);
-    c->reqfd = c->respfd = c->keepfd = -1;
-    c->fd = fd; c->st = READING; c->last = time(NULL);
+    c->src.kind = K_CLIENT; c->src.obj = c;
+    c->fd = fd; c->st = READING; c->evm = EV_IN; c->last = time(NULL);
+    if (ev_add(fd, EV_IN, &c->src) < 0) { close(fd); free(c); continue; }
     if (nconns == capconns) conns = realloc(conns, (capconns = capconns ? capconns * 2 : 256) * sizeof *conns);
-    conns[nconns++] = c;
+    c->idx = nconns; conns[nconns++] = c;
   }
 }
 
@@ -158,7 +289,8 @@ static void flush_out(conn *c) {
   /* drop the request we just answered, keep pipelined bytes */
   memmove(c->in, c->in + c->reqlen, c->inlen - c->reqlen);
   c->inlen -= c->reqlen; c->reqlen = 0;
-  c->st = READING; c->last = time(NULL);
+  if (!c->inlen) { free(c->in); c->in = NULL; c->incap = 0; } /* an idle keep-alive connection holds no buffer */
+  conn_set(c, READING); c->last = time(NULL);
   try_requests(c);
 }
 
@@ -168,7 +300,8 @@ static void respond(conn *c, int code, const char *body, size_t blen) {
     "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: %s\r\n\r\n",
     code, reason(code), blen, c->close_after ? "close" : "keep-alive");
   c->out = malloc(hl + blen); memcpy(c->out, head, hl); memcpy(c->out + hl, body, blen);
-  c->outlen = hl + blen; c->outpos = 0; c->st = WRITING; c->last = time(NULL);
+  c->outlen = hl + blen; c->outpos = 0; c->last = time(NULL);
+  conn_set(c, WRITING);
   flush_out(c);
 }
 
@@ -205,7 +338,9 @@ static void try_requests(conn *c) {
   if (clen > MAX_BODY) { respond_err(c, 413, "body too large"); return; }
   if (c->inlen < hdrlen + clen) return;                 /* wait for the rest of the body */
   c->hdrlen = hdrlen; c->clen = clen; c->reqlen = hdrlen + clen; c->close_after = !ka;
-  c->st = QUEUED; c->seq = ++seqno;
+  conn_set(c, QUEUED); c->last = time(NULL); c->qnext = NULL;
+  if (runq_tail) runq_tail->qnext = c; else runq_head = c;
+  runq_tail = c;
 }
 
 static void on_readable(conn *c) {
@@ -234,16 +369,16 @@ static const char *stmt_sql[NSTMT] = {
 enum dstate { D_DOWN, D_CONNECTING, D_PREPARING, D_IDLE, D_BUSY };
 typedef struct dbc {
   PGconn *pg; enum dstate st;
-  short polldir; int wantout;
+  evsrc src; int evfd, evm;        /* registered socket and interest mask */
+  int wantdir; int wantout;        /* while connecting: EV_IN or EV_OUT; when connected: unflushed output */
   int prep, stmt;
   int64_t retry_at, since, backoff;
-  conn *owner; PGresult *res;
+  worker *owner; PGresult *res;
 } dbc;
 
 static dbc *pool; static int npool;
 static const char *dburl;
 static char last_dberr[256] = "database not connected";
-static unsigned long dbseqno;
 
 static int64_t now_ms(void) {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -270,41 +405,47 @@ static void sb_err(sbuf *b, const char *state, const char *msg) {
   sb_str(b, "\n");
 }
 
-static void db_try_write(conn *c);
+static void db_try_write(worker *c);
 
 /* Takes ownership of the buffer and starts pushing it into db.resp. */
-static void db_reply(conn *c, sbuf *b) {
+static void db_reply(worker *c, sbuf *b) {
   c->dout = b->p; c->dlen = b->n; c->dpos = 0; c->dbst = DB_RESP;
   db_try_write(c);
 }
-static void db_reply_err(conn *c, const char *state, const char *msg) {
+static void db_reply_err(worker *c, const char *state, const char *msg) {
   sbuf b = {0}; sb_err(&b, state, msg); db_reply(c, &b);
 }
 
-static void db_try_write(conn *c) {
+static void db_try_write(worker *c) {
+  if (c->respfd < 0) return;
   while (c->dpos < c->dlen) {
     ssize_t n = write(c->respfd, c->dout + c->dpos, c->dlen - c->dpos);
     if (n > 0) c->dpos += n;
     else if (n < 0 && errno == EINTR) continue;
-    else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-    else break; /* cannot happen while the keeper fd is open; give up, TeX sees EOF */
+    else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { /* a feed is bigger than the pipe: wait for room */
+      if (!c->dwait) { ev_add(c->respfd, EV_OUT, &c->dsrc[1]); c->dwait = 1; }
+      return;
+    } else break; /* cannot happen while the keeper fd is open; give up, TeX sees EOF */
   }
   free(c->dout); c->dout = NULL;
-  close(c->respfd); c->respfd = -1; /* the only writer: TeX now reads EOF (the keeper keeps unread data alive) */
+  ev_close(c->respfd); c->respfd = -1; /* the only writer: TeX now reads EOF (the keeper keeps unread data alive) */
   c->dbst = DB_DONE;
 }
 
-static void db_release(conn *c) {
+static void db_release(worker *c) {
   if (c->dbc) c->dbc->owner = NULL; /* result is discarded when it arrives */
   c->dbc = NULL;
-  if (c->reqfd >= 0) close(c->reqfd);
-  if (c->respfd >= 0) close(c->respfd);
-  if (c->keepfd >= 0) close(c->keepfd);
-  c->reqfd = c->respfd = c->keepfd = -1;
+  if (c->dbst == DB_QUEUED) {                    /* leave the database queue */
+    worker **pp = &dbq_head, *prev = NULL;
+    while (*pp && *pp != c) { prev = *pp; pp = &(*pp)->dbnext; }
+    if (*pp) { *pp = c->dbnext; if (dbq_tail == c) dbq_tail = prev; }
+  }
+  ev_close(c->reqfd); ev_close(c->respfd); ev_close(c->keepfd);
+  c->reqfd = c->respfd = c->keepfd = -1; c->dwait = 0;
   free(c->dout); c->dout = NULL; c->dbst = DB_NONE;
 }
 
-static void db_format(conn *c, dbc *d) {
+static void db_format(worker *c, dbc *d) {
   PGresult *r = d->res; sbuf b = {0};
   ExecStatusType st = r ? PQresultStatus(r) : PGRES_FATAL_ERROR;
   if (!r) sb_err(&b, "CONN", PQerrorMessage(d->pg));
@@ -326,7 +467,25 @@ static void db_format(conn *c, dbc *d) {
   db_reply(c, &b);
 }
 
-static void dbc_close_pg(dbc *d) { if (d->pg) PQfinish(d->pg); d->pg = NULL; }
+static void dbc_close_pg(dbc *d) {
+  if (d->evfd >= 0) ev_del(d->evfd);
+  d->evfd = -1; d->evm = 0;
+  if (d->pg) PQfinish(d->pg);
+  d->pg = NULL;
+}
+
+/* Makes the registration match what the connection wants now. While connecting libpq may swap the socket (next
+   address), so a connecting dbc is re-registered from scratch every time. */
+static void dbc_sync(dbc *d) {
+  if (!d->pg) return;
+  int sfd = PQsocket(d->pg);
+  if (sfd < 0) return;
+  int want = d->st == D_CONNECTING ? d->wantdir : (EV_IN | (d->wantout ? EV_OUT : 0));
+  if (d->st == D_CONNECTING || sfd != d->evfd) {
+    if (d->evfd >= 0) ev_del(d->evfd);
+    ev_add(sfd, want, &d->src); d->evfd = sfd; d->evm = want;
+  } else if (want != d->evm) { ev_mod(sfd, want, &d->src); d->evm = want; }
+}
 
 /* The connection is unusable: answer its owner (if still around), reconnect later with backoff. */
 static void dbc_fail(dbc *d, const char *why) {
@@ -334,7 +493,7 @@ static void dbc_fail(dbc *d, const char *why) {
   snprintf(last_dberr, sizeof last_dberr, "%s", m);
   size_t l = strlen(last_dberr); while (l && (last_dberr[l - 1] == '\n' || last_dberr[l - 1] == '\r')) last_dberr[--l] = 0;
   if (d->res) { PQclear(d->res); d->res = NULL; }
-  if (d->owner) { conn *o = d->owner; d->owner = NULL; o->dbc = NULL; db_reply_err(o, "CONN", last_dberr); }
+  if (d->owner) { worker *o = d->owner; d->owner = NULL; o->dbc = NULL; db_reply_err(o, "CONN", last_dberr); }
   dbc_close_pg(d);
   d->st = D_DOWN; d->backoff = d->backoff ? (d->backoff * 2 > 2000 ? 2000 : d->backoff * 2) : 100;
   d->retry_at = now_ms() + d->backoff;
@@ -346,7 +505,8 @@ static void dbc_connect(dbc *d) {
   d->pg = PQconnectStartParams(keys, vals, 1);
   d->since = now_ms();
   if (!d->pg || PQstatus(d->pg) == CONNECTION_BAD) { dbc_fail(d, "cannot start connection"); return; }
-  d->st = D_CONNECTING; d->polldir = POLLOUT; d->wantout = 0;
+  d->st = D_CONNECTING; d->wantdir = EV_OUT; d->wantout = 0;
+  dbc_sync(d);
 }
 
 static int dbc_flush(dbc *d) {
@@ -364,8 +524,8 @@ static void dbc_prepare_next(dbc *d) {
 }
 
 /* Starts the command line of c on idle connection d. */
-static void dbc_run(dbc *d, conn *c) {
-  char line[sizeof c->dbline]; memcpy(line, c->dbline, sizeof line);
+static void dbc_run(dbc *d, worker *c) {
+  char line[DBLINE]; memcpy(line, c->dbline, sizeof line);
   char *t[5] = {0}; int nt = 0, bad = 0; char *sp = NULL;
   for (char *w = strtok_r(line, " \t\r\n", &sp); w && nt < 5; w = strtok_r(NULL, " \t\r\n", &sp)) t[nt++] = w;
   const char *vals[2] = {0}; int np = 0, stmt = -1; char *body = NULL;
@@ -390,7 +550,7 @@ static void dbc_run(dbc *d, conn *c) {
   free(body);
   d->stmt = stmt; d->st = D_BUSY; d->owner = c; d->since = now_ms(); c->dbc = d; c->dbst = DB_INFLIGHT;
   if (!ok) { dbc_fail(d, "send failed"); return; }
-  dbc_flush(d);
+  if (dbc_flush(d) == 0) dbc_sync(d);
 }
 
 /* Reads whatever arrived. Handles the PREPARING and BUSY states. */
@@ -408,7 +568,7 @@ static void dbc_input(dbc *d) {
       PQclear(d->res); d->res = NULL; d->prep++; dbc_prepare_next(d); return;
     }
     /* D_BUSY: the query is complete */
-    conn *o = d->owner; d->owner = NULL;
+    worker *o = d->owner; d->owner = NULL;
     if (o) { o->dbc = NULL; db_format(o, d); }
     if (d->res) { PQclear(d->res); d->res = NULL; }
     if (PQstatus(d->pg) != CONNECTION_OK) { dbc_fail(d, "connection lost"); return; }
@@ -417,24 +577,27 @@ static void dbc_input(dbc *d) {
   }
 }
 
-static void dbc_event(dbc *d, short rev) {
+static void dbc_event(dbc *d, int rev) {
   if (d->st == D_CONNECTING) {
     PostgresPollingStatusType ps = PQconnectPoll(d->pg);
-    if (ps == PGRES_POLLING_READING) d->polldir = POLLIN;
-    else if (ps == PGRES_POLLING_WRITING) d->polldir = POLLOUT;
+    if (ps == PGRES_POLLING_READING) d->wantdir = EV_IN;
+    else if (ps == PGRES_POLLING_WRITING) d->wantdir = EV_OUT;
     else if (ps == PGRES_POLLING_OK) {
       if (PQsetnonblocking(d->pg, 1) != 0) { dbc_fail(d, "cannot set nonblocking"); return; }
       d->prep = 0; dbc_prepare_next(d);
-    } else dbc_fail(d, "connection failed");
+    } else { dbc_fail(d, "connection failed"); return; }
+    dbc_sync(d);
     return;
   }
-  if ((rev & POLLOUT) && d->wantout && dbc_flush(d) < 0) return;
+  if ((rev & EV_OUT) && d->wantout && dbc_flush(d) < 0) return;
   if (d->st == D_IDLE) {
     if (!PQconsumeInput(d->pg) || PQstatus(d->pg) != CONNECTION_OK) dbc_fail(d, "connection lost");
-    else if (rev & (POLLHUP | POLLERR)) dbc_fail(d, "connection lost");
+    else if (rev & EV_ERR) dbc_fail(d, "connection lost");
+    else dbc_sync(d);
     return;
   }
-  if (rev & (POLLIN | POLLHUP | POLLERR)) dbc_input(d);
+  if (rev & (EV_IN | EV_ERR)) dbc_input(d);
+  if (d->pg) dbc_sync(d);
 }
 
 static void db_init(void) {
@@ -444,11 +607,17 @@ static void db_init(void) {
   if (n > 512) n = 512;
   npool = (int)n; dburl = getenv("DATABASE_URL");
   pool = calloc(npool, sizeof *pool);
-  for (int i = 0; i < npool; i++) dbc_connect(&pool[i]);
+  for (int i = 0; i < npool; i++) { pool[i].evfd = -1; pool[i].src = (evsrc){K_DB, &pool[i]}; dbc_connect(&pool[i]); }
 }
 
-/* Hands queued commands to idle connections (oldest first); fails them when the pool is down or they waited too long. */
-static void db_dispatch(void) {
+/* Hands queued commands to idle connections (oldest first); fails them when the pool is down or they waited too long.
+   Returns 1 while some pool connection is down (the loop then wakes up often enough to retry). */
+static int db_any_down(void) {
+  for (int i = 0; i < npool; i++) if (pool[i].st == D_DOWN) return 1;
+  return 0;
+}
+
+static int db_dispatch(void) {
   int64_t now = now_ms();
   for (int i = 0; i < npool; i++)
     if (pool[i].st == D_DOWN && now >= pool[i].retry_at) dbc_connect(&pool[i]);
@@ -457,36 +626,44 @@ static void db_dispatch(void) {
     if (d->st == D_CONNECTING && now - d->since > DB_CONNECT_MS) dbc_fail(d, "connection timeout");
     else if (d->st == D_BUSY && now - d->since > DB_QUERY_MS) dbc_fail(d, "query timeout");
   }
-  int live = 0; for (int i = 0; i < npool; i++) if (pool[i].st != D_DOWN) live++;
+  int live = 0, down = 0;
+  for (int i = 0; i < npool; i++) { if (pool[i].st != D_DOWN) live++; else down = 1; }
   time_t tnow = time(NULL);
-  for (;;) {
-    conn *best = NULL;
-    for (size_t i = 0; i < nconns; i++)
-      if (conns[i]->dbst == DB_QUEUED && (!best || conns[i]->dbseq < best->dbseq)) best = conns[i];
-    if (!best) return;
-    if (!live) { db_reply_err(best, "CONN", last_dberr); continue; }
-    if (tnow - best->dbqt > DB_QUEUE_SECS) { db_reply_err(best, "CONN", "timed out waiting for a database connection"); continue; }
+  while (dbq_head) {
+    worker *best = dbq_head;
+    if (!live || tnow - best->dbqt > DB_QUEUE_SECS) {
+      dbq_head = best->dbnext; if (!dbq_head) dbq_tail = NULL;
+      db_reply_err(best, "CONN", live ? "timed out waiting for a database connection" : last_dberr);
+      continue;
+    }
     dbc *idle = NULL;
     for (int i = 0; i < npool; i++) if (pool[i].st == D_IDLE) { idle = &pool[i]; break; }
-    if (!idle) return;
+    if (!idle) break;
+    dbq_head = best->dbnext; if (!dbq_head) dbq_tail = NULL;
     dbc_run(idle, best);
   }
+  return down;
 }
 
-static void db_read_line(conn *c) {
+static void db_read_line(worker *c) {
   for (;;) {
-    ssize_t n = read(c->reqfd, c->dbline + c->dblen, sizeof c->dbline - 1 - c->dblen);
+    ssize_t n = read(c->reqfd, c->dbline + c->dblen, DBLINE - 1 - c->dblen);
     if (n > 0) {
       c->dblen += n;
       char *nl = memchr(c->dbline, '\n', c->dblen);
-      if (nl) { *nl = 0; c->dbst = DB_QUEUED; c->dbseq = ++dbseqno; c->dbqt = time(NULL); return; }
-      if (c->dblen >= sizeof c->dbline - 1) { db_reply_err(c, "USAGE", "command too long"); return; }
+      if (nl) {
+        *nl = 0; ev_del(c->reqfd); c->dbst = DB_QUEUED; c->dbqt = time(NULL); c->dbnext = NULL;
+        if (dbq_tail) dbq_tail->dbnext = c; else dbq_head = c;
+        dbq_tail = c;
+        return;
+      }
+      if (c->dblen >= DBLINE - 1) { ev_del(c->reqfd); db_reply_err(c, "USAGE", "command too long"); return; }
     } else if (n < 0 && errno == EINTR) continue;
     else return; /* EAGAIN (or nothing more) */
   }
 }
 
-/* ---------- running TeX ---------- */
+/* ---------- TeX workers ---------- */
 
 static int write_file(const char *dir, const char *name, const char *data, size_t len) {
   char path[PATH_MAX + 16]; snprintf(path, sizeof path, "%s/%s", dir, name);
@@ -512,62 +689,96 @@ static void rm_rf(const char *dir) {
   rmdir(dir);
 }
 
-static void spawn(conn *c) {
-  snprintf(c->dir, sizeof c->dir, "%s/texcgi.XXXXXX", tmpbase);
-  if (!mkdtemp(c->dir)) { c->dir[0] = 0; respond_err(c, 500, "internal server error"); return; }
-
-  /* req.txt: request line + headers, CRLF -> LF, no blank line at the end (every line LF-terminated) */
-  size_t hl = c->hdrlen - 4, k = 0; char *req = malloc(hl + 2);
-  for (size_t i = 0; i < hl; i++) if (!(c->in[i] == '\r' && i + 1 < hl + 2 && c->in[i + 1] == '\n')) req[k++] = c->in[i];
-  req[k++] = '\n';
-  char meta[PATH_MAX + 512]; const char *secret = getenv("JWT_SECRET");
-  int ml = snprintf(meta, sizeof meta, "%ld\n%ld\n%s\n", (long)time(NULL), (long)start_time, secret ? secret : "");
-  int bad = write_file(c->dir, "meta.txt", meta, ml) || write_file(c->dir, "req.txt", req, k)
-         || write_file(c->dir, "body.txt", c->in + c->hdrlen, c->clen);
-  free(req);
-  if (!bad) {
-    char p1[PATH_MAX + 16], p2[PATH_MAX + 16];
-    snprintf(p1, sizeof p1, "%s/db.req", c->dir); snprintf(p2, sizeof p2, "%s/db.resp", c->dir);
-    if (mkfifo(p1, 0600) || mkfifo(p2, 0600)) bad = 1;
-    else {
-      /* db.req read-write so the host is also a writer (no POLLHUP games); db.resp: a keeper reader first, so the
-         non-blocking writer open works and unread data survives until TeX opens it */
-      c->reqfd = open(p1, O_RDWR | O_NONBLOCK);
-      c->keepfd = open(p2, O_RDONLY | O_NONBLOCK);
-      c->respfd = c->keepfd >= 0 ? open(p2, O_WRONLY | O_NONBLOCK) : -1;
-      if (c->reqfd < 0 || c->keepfd < 0 || c->respfd < 0) bad = 1;
-      else { set_nb_cloexec(c->reqfd); set_nb_cloexec(c->keepfd); set_nb_cloexec(c->respfd); }
-    }
+/* Removes the work directories of hosts that are gone (killed without cleaning up). */
+static void rm_stale(void) {
+  DIR *d = opendir(tmpbase); if (!d) return;
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    if (strncmp(e->d_name, "texcgi.", 7)) continue;
+    char *end; long pid = strtol(e->d_name + 7, &end, 10);
+    if (*end || pid <= 0 || (kill((pid_t)pid, 0) == 0 || errno == EPERM)) continue;
+    char path[PATH_MAX + 300]; snprintf(path, sizeof path, "%s/%s", tmpbase, e->d_name); rm_rf(path);
   }
-  if (bad) { db_release(c); rm_rf(c->dir); c->dir[0] = 0; respond_err(c, 500, "internal server error"); return; }
-  c->dbst = DB_WAITLINE; c->dblen = 0;
-
-  char fmtarg[PATH_MAX + 32]; snprintf(fmtarg, sizeof fmtarg, "-fmt=%s", fmtpath);
-  pid_t pid = fork();
-  if (pid < 0) { db_release(c); rm_rf(c->dir); respond_err(c, 500, "internal server error"); return; }
-  if (pid == 0) {
-    signal(SIGPIPE, SIG_DFL);
-    int dn = open("/dev/null", O_RDWR);
-    if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); }
-    if (chdir(c->dir) != 0) _exit(127);
-    setenv("max_print_line", "1000000", 1); setenv("error_line", "254", 1); setenv("half_error_line", "238", 1);
-    setenv("openout_any", "a", 1); setenv("openin_any", "a", 1);
-    execlp("pdftex", "pdftex", fmtarg, "-8bit", "-interaction=batchmode", "-halt-on-error",
-           "\\feedmain", (char *)NULL);
-    _exit(127);
-  }
-  c->pid = pid; c->started = time(NULL); c->st = RUNNING; running++;
+  closedir(d);
 }
 
-/* Reads <dir>/resp.txt and answers. */
-static void finish(conn *c, int status) {
+static int64_t now_ms(void);
+static void dispatch(void);
+
+static void idle_push(worker *w) { w->st = W_IDLE; idle[nidle++] = w; }
+static void idle_remove(worker *w) {
+  for (int i = 0; i < nidle; i++) if (idle[i] == w) { idle[i] = idle[--nidle]; return; }
+}
+
+static void spawn_worker(worker *w) {
+  rm_rf(w->dir);
+  char p[PATH_MAX + 32];
+  w->jobfd = w->jobkeep = w->donefd = -1;
+  int ok = mkdir(w->dir, 0700) == 0;
+  if (ok) {
+    snprintf(p, sizeof p, "%s/job.fifo", w->dir); ok = mkfifo(p, 0600) == 0;
+    if (ok) { /* a keeper reader first: the non-blocking writer open needs a reader, and so does TeX's own open */
+      w->jobkeep = open(p, O_RDONLY | O_NONBLOCK);
+      w->jobfd = w->jobkeep >= 0 ? open(p, O_WRONLY | O_NONBLOCK) : -1;
+      ok = w->jobkeep >= 0 && w->jobfd >= 0;
+    }
+  }
+  if (ok) {
+    snprintf(p, sizeof p, "%s/done.fifo", w->dir); ok = mkfifo(p, 0600) == 0;
+    if (ok) { w->donefd = open(p, O_RDWR | O_NONBLOCK); ok = w->donefd >= 0; } /* O_RDWR: never sees EOF between answers */
+  }
+  if (ok) {
+    set_nb_cloexec(w->jobkeep); set_nb_cloexec(w->jobfd); set_nb_cloexec(w->donefd);
+    ok = ev_add(w->donefd, EV_IN, &w->dsrc[2]) == 0;
+  }
+  char fmtarg[PATH_MAX + 32]; snprintf(fmtarg, sizeof fmtarg, "-fmt=%s", fmtpath);
+  pid_t pid = ok ? fork() : -1;
+  if (pid == 0) {
+    signal(SIGPIPE, SIG_DFL); signal(SIGTERM, SIG_DFL); signal(SIGINT, SIG_DFL);
+    int dn = open("/dev/null", O_RDWR);
+    if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); }
+    if (chdir(w->dir) != 0) _exit(127);
+    /* no \openout lines in the log, long log lines; files are plain names in the cwd, so the default
+       openin_any / openout_any ("paranoid") are fine */
+    setenv("log_openout", "0", 1); setenv("max_print_line", "1000000", 1);
+    setenv("error_line", "254", 1); setenv("half_error_line", "238", 1);
+    execlp("pdftex", "pdftex", fmtarg, "-8bit", "-interaction=batchmode", "-halt-on-error", "-jobname=feedw",
+           "\\def\\feedctl{}\\feedloop", (char *)NULL);
+    _exit(127);
+  }
+  if (pid < 0) {                                      /* try again shortly */
+    ev_close(w->donefd); close(w->jobfd); close(w->jobkeep); w->jobfd = w->jobkeep = w->donefd = -1;
+    w->st = W_DOWN; w->retry_at = now_ms() + 500; w->pid = 0; return;
+  }
+  w->pid = pid; w->spawned_ms = now_ms(); w->served = 0; w->killed = 0; w->dnlen = 0; w->cur = NULL;
+  idle_push(w);
+}
+
+/* Tears the worker's files down; the process is gone or about to be. */
+static void worker_cleanup(worker *w) {
+  idle_remove(w);
+  ev_close(w->donefd); ev_close(w->jobfd); ev_close(w->jobkeep);
+  w->jobfd = w->jobkeep = w->donefd = -1;
+  if (keep_logs) {
+    char from[PATH_MAX + 32], to[PATH_MAX + 64];
+    snprintf(from, sizeof from, "%s/feedw.log", w->dir); snprintf(to, sizeof to, "%s/w%d.%lu.log", workdir, w->id, ++logseq);
+    rename(from, to);
+  }
+  rm_rf(w->dir);
+  w->pid = 0; w->st = W_DOWN;
+}
+
+/* Reads <dir>/resp.txt (if the worker said it is done) and answers the client. */
+static void finish_request(worker *w, int ok) {
+  conn *c = w->cur; w->cur = NULL;
   char path[PATH_MAX + 16], buf[1 << 20]; size_t n = 0;
-  snprintf(path, sizeof path, "%s/resp.txt", c->dir);
-  int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  snprintf(path, sizeof path, "%s/resp.txt", w->dir);
   FILE *f = ok ? fopen(path, "rb") : NULL;
   if (f) { n = fread(buf, 1, sizeof buf, f); fclose(f); }
-  db_release(c);
-  rm_rf(c->dir); c->pid = 0; c->dir[0] = 0; running--;
+  db_release(w);
+  static const char *const files[] = {"meta.txt", "req.txt", "body.txt", "newbody.txt", "resp.txt", "db.req", "db.resp"};
+  for (size_t i = 0; i < sizeof files / sizeof *files; i++) { snprintf(path, sizeof path, "%s/%s", w->dir, files[i]); unlink(path); }
+  if (c->dead) { conn_free(c); return; }
   int code = 0;
   if (n >= 5 && buf[3] == '\n' && buf[0] >= '1' && buf[0] <= '5' && buf[1] >= '0' && buf[1] <= '9' && buf[2] >= '0' && buf[2] <= '9')
     code = (buf[0] - '0') * 100 + (buf[1] - '0') * 10 + (buf[2] - '0');
@@ -578,23 +789,128 @@ static void finish(conn *c, int status) {
   respond(c, code, buf + 4, bl);
 }
 
+/* The worker has served enough: closing job.fifo makes TeX leave its loop; the reaper starts the next one. */
+static void retire(worker *w) {
+  w->st = W_RETIRING; w->started = time(NULL);
+  ev_close(w->jobfd); w->jobfd = -1;
+}
+
+static void worker_idle(worker *w) {
+  if (recycle_after > 0 && w->served >= (unsigned long)recycle_after) retire(w);
+  else idle_push(w);
+}
+
+/* done.fifo is readable: a complete line means resp.txt is ready. */
+static void on_done(worker *w) {
+  if (w->donefd < 0) return;
+  for (;;) {
+    ssize_t n = read(w->donefd, w->dnbuf + w->dnlen, sizeof w->dnbuf - w->dnlen);
+    if (n <= 0) return;
+    w->dnlen += n;
+    char *nl = memchr(w->dnbuf, '\n', w->dnlen);
+    if (!nl) { if (w->dnlen == sizeof w->dnbuf) w->dnlen = 0; continue; }
+    size_t used = nl - w->dnbuf + 1, rest = w->dnlen - used;
+    int good = used == 3 && !memcmp(w->dnbuf, "ok", 2);
+    memmove(w->dnbuf, w->dnbuf + used, rest); w->dnlen = rest;
+    if (w->st == W_BUSY) { w->served++; finish_request(w, good); worker_idle(w); }
+    if (w->st != W_IDLE && w->st != W_RETIRING) return;
+  }
+}
+
+/* A worker process ended: answer its request (500, unless it had already answered), start a replacement. */
+static void worker_exited(worker *w, int status) {
+  int expected = w->st == W_RETIRING;
+  if (w->st == W_BUSY) {
+    on_done(w);                                   /* it may have answered just before dying */
+    if (w->st == W_BUSY) { (void)status; w->served++; finish_request(w, 0); }
+  }
+  int64_t lived = now_ms() - w->spawned_ms;
+  worker_cleanup(w);
+  if (stopping) return;
+  if (expected || lived >= 1000) spawn_worker(w);
+  else { w->retry_at = now_ms() + 500; }          /* dying at once (no pdftex?): do not spin */
+}
+
+static void start_request(worker *w, conn *c) {
+  /* req.txt: request line + headers, CRLF -> LF, no blank line at the end (every line LF-terminated) */
+  size_t hl = c->hdrlen - 4, k = 0; char *req = malloc(hl + 2);
+  for (size_t i = 0; i < hl; i++) if (!(c->in[i] == '\r' && i + 1 < hl + 2 && c->in[i + 1] == '\n')) req[k++] = c->in[i];
+  req[k++] = '\n';
+  char meta[512]; const char *secret = getenv("JWT_SECRET");
+  int ml = snprintf(meta, sizeof meta, "%ld\n%ld\n%s\n", (long)time(NULL), (long)start_time, secret ? secret : "");
+  if (ml >= (int)sizeof meta) ml = sizeof meta - 1;
+  int bad = write_file(w->dir, "meta.txt", meta, ml) || write_file(w->dir, "req.txt", req, k)
+         || write_file(w->dir, "body.txt", c->in + c->hdrlen, c->clen);
+  free(req);
+  if (!bad) {
+    char p1[PATH_MAX + 16], p2[PATH_MAX + 16];
+    snprintf(p1, sizeof p1, "%s/db.req", w->dir); snprintf(p2, sizeof p2, "%s/db.resp", w->dir);
+    if (mkfifo(p1, 0600) || mkfifo(p2, 0600)) bad = 1;
+    else {
+      /* db.req read-write so the host is also a writer (no hangup games); db.resp: a keeper reader first, so the
+         non-blocking writer open works and unread data survives until TeX opens it */
+      w->reqfd = open(p1, O_RDWR | O_NONBLOCK);
+      w->keepfd = open(p2, O_RDONLY | O_NONBLOCK);
+      w->respfd = w->keepfd >= 0 ? open(p2, O_WRONLY | O_NONBLOCK) : -1;
+      if (w->reqfd < 0 || w->keepfd < 0 || w->respfd < 0) bad = 1;
+      else {
+        set_nb_cloexec(w->reqfd); set_nb_cloexec(w->keepfd); set_nb_cloexec(w->respfd);
+        if (ev_add(w->reqfd, EV_IN, &w->dsrc[0]) < 0) bad = 1;
+      }
+    }
+  }
+  if (!bad && write(w->jobfd, "\n", 1) != 1) bad = 1;      /* the job line: an empty path prefix */
+  w->cur = c; conn_set(c, RUNNING);
+  if (bad) {
+    w->st = W_BUSY; w->served++; finish_request(w, 0); worker_idle(w); return;
+  }
+  w->dbst = DB_WAITLINE; w->dblen = 0; w->dwait = 0;
+  w->st = W_BUSY; w->started = time(NULL);
+}
+
+static void dispatch(void) {
+  while (runq_head && nidle > 0) {
+    conn *c = runq_head;
+    runq_head = c->qnext; if (!runq_head) runq_tail = NULL;
+    if (c->dead) { conn_free(c); continue; }               /* the client left while it was queued */
+    if (time(NULL) - c->last > QUEUE_SECS) { conn_set(c, READING); respond_err(c, 500, "internal server error"); continue; }
+    start_request(idle[--nidle], c);
+  }
+}
+
 static void reap(void) {
   char tmp[64];
   while (read(selfpipe[0], tmp, sizeof tmp) > 0) {}
   int status; pid_t pid;
   while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
-    for (size_t i = 0; i < nconns; i++)
-      if (conns[i]->st == RUNNING && conns[i]->pid == pid) { finish(conns[i], status); break; }
+    for (int i = 0; i < nworkers; i++)
+      if (workers[i].pid == pid) { worker_exited(&workers[i], status); break; }
 }
 
-static void dispatch(void) {
-  while (running < max_children) {
-    conn *best = NULL;
-    for (size_t i = 0; i < nconns; i++)
-      if (conns[i]->st == QUEUED && (!best || conns[i]->seq < best->seq)) best = conns[i];
-    if (!best) return;
-    spawn(best);
+/* Per-round timers: request time limits, retirements that hang, workers waiting to be restarted. */
+static void tick(void) {
+  time_t now = time(NULL); int64_t nm = now_ms();
+  for (int i = 0; i < nworkers; i++) {
+    worker *w = &workers[i];
+    if (w->st == W_BUSY && now - w->started > CHILD_SECS && !w->killed) { kill(w->pid, SIGKILL); w->killed = 1; }
+    else if (w->st == W_RETIRING && now - w->started > 5 && !w->killed) { kill(w->pid, SIGKILL); w->killed = 1; }
+    else if (w->st == W_DOWN && nm >= w->retry_at && !stopping) spawn_worker(w);
   }
+}
+
+/* Closing job.fifo lets a worker finish its log; whoever is still there after a second is killed. */
+static void shutdown_all(void) {
+  for (int i = 0; i < nworkers; i++) if (workers[i].jobfd >= 0) { close(workers[i].jobfd); workers[i].jobfd = -1; }
+  for (int t = 0; t < 100; t++) {
+    int alive = 0;
+    for (int i = 0; i < nworkers; i++) if (workers[i].pid > 0 && waitpid(workers[i].pid, NULL, WNOHANG) == 0) alive = 1;
+    if (!alive) break;
+    usleep(10000);
+  }
+  for (int i = 0; i < nworkers; i++) if (workers[i].pid > 0) kill(workers[i].pid, SIGKILL);
+  while (waitpid(-1, NULL, 0) > 0) {}
+  for (int i = 0; i < nworkers; i++) if (workers[i].pid > 0) worker_cleanup(&workers[i]);
+  if (!keep_logs) rm_rf(workdir);
 }
 
 /* ---------- main ---------- */
@@ -619,82 +935,81 @@ int main(int argc, char **argv) {
   if (!port || !*port) port = "3000";
   find_paths(argv[0]);
   start_time = time(NULL);
-  long nc = sysconf(_SC_NPROCESSORS_ONLN);
-  max_children = 4 * (nc > 0 ? (int)nc : 1);
-  if (getenv("MAX_CHILDREN") && atoi(getenv("MAX_CHILDREN")) > 0) max_children = atoi(getenv("MAX_CHILDREN"));
-  if (max_children > 512) max_children = 512;
+  long nc = sysconf(_SC_NPROCESSORS_ONLN); if (nc < 1) nc = 1;
+  long nw = 2 * nc;                                   /* TeX workers wait on Postgres half the time: 2 x cores */
+  if (getenv("WORKERS") && atol(getenv("WORKERS")) > 0) nw = atol(getenv("WORKERS"));
+  else if (getenv("MAX_CHILDREN") && atol(getenv("MAX_CHILDREN")) > 0) nw = atol(getenv("MAX_CHILDREN")); /* old name */
+  if (nw > 512) nw = 512;
+  nworkers = (int)nw;
+  keep_logs = getenv("KEEP_WORKDIR") && *getenv("KEEP_WORKDIR") && *getenv("KEEP_WORKDIR") != '0';
+  if (getenv("WORKER_MAX_REQUESTS") && *getenv("WORKER_MAX_REQUESTS")) recycle_after = atol(getenv("WORKER_MAX_REQUESTS"));
 
   signal(SIGPIPE, SIG_IGN);
   if (pipe(selfpipe) < 0) die("pipe");
   set_nb_cloexec(selfpipe[0]); set_nb_cloexec(selfpipe[1]);
   struct sigaction sa = {0}; sa.sa_handler = on_chld; sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
   sigemptyset(&sa.sa_mask); sigaction(SIGCHLD, &sa, NULL);
+  sa.sa_handler = on_term; sa.sa_flags = 0; sigaction(SIGTERM, &sa, NULL); sigaction(SIGINT, &sa, NULL);
 
   int lfd[2], nl = 0;
   lfd[nl++] = listen_on(host, port);
   if (extra && *extra && strcmp(extra, port)) lfd[nl++] = listen_on(host, extra);
-  fprintf(stderr, "host: listening on %s:%s%s%s, max %d children, fmt %s\n", host, port, nl > 1 ? " and " : "",
-          nl > 1 ? extra : "", max_children, fmtpath);
 
+  rm_stale();
+  snprintf(workdir, sizeof workdir, "%s/texcgi.%ld", tmpbase, (long)getpid());
+  if (mkdir(workdir, 0700) != 0) die("mkdir workdir");
+  fprintf(stderr, "host: listening on %s:%s%s%s, %d TeX workers (recycled after %ld requests), workdir %s, fmt %s\n", host, port,
+          nl > 1 ? " and " : "", nl > 1 ? extra : "", nworkers, recycle_after, workdir, fmtpath);
+
+  ev_init();
+  evsrc s_self = {K_SELF, NULL}, s_listen[2] = {{K_LISTEN, NULL}, {K_LISTEN, NULL}};
+  if (ev_add(selfpipe[0], EV_IN, &s_self) < 0) die("ev_add");
+  for (int i = 0; i < nl; i++) { s_listen[i].obj = (void *)(intptr_t)lfd[i]; if (ev_add(lfd[i], EV_IN, &s_listen[i]) < 0) die("ev_add"); }
   db_init();
-  struct pollfd *pfds = NULL; conn **owner = NULL; int *kind = NULL; dbc **downer = NULL; size_t cap = 0;
-  enum { K_SELF, K_LISTEN, K_CLIENT, K_REQ, K_RESP, K_DB };
-  for (;;) {
-    size_t need = nconns * 2 + npool + 8;
-    if (cap < need) {
-      cap = need * 2;
-      pfds = realloc(pfds, cap * sizeof *pfds); owner = realloc(owner, cap * sizeof *owner);
-      kind = realloc(kind, cap * sizeof *kind); downer = realloc(downer, cap * sizeof *downer);
-    }
-    size_t np = 0;
-#define ADD(FD, EV, K, C, D) do { pfds[np].fd = (FD); pfds[np].events = (EV); pfds[np].revents = 0; kind[np] = (K); owner[np] = (C); downer[np] = (D); np++; } while (0)
-    ADD(selfpipe[0], POLLIN, K_SELF, NULL, NULL);
-    for (int i = 0; i < nl; i++) ADD(lfd[i], POLLIN, K_LISTEN, NULL, NULL);
-    int any_down = 0;
-    for (int i = 0; i < npool; i++) {
-      dbc *d = &pool[i];
-      if (d->st == D_DOWN) { any_down = 1; continue; }
-      short ev = d->st == D_CONNECTING ? d->polldir : (POLLIN | (d->wantout ? POLLOUT : 0));
-      int sfd = PQsocket(d->pg);
-      if (sfd < 0) { dbc_fail(d, "connection lost"); any_down = 1; continue; }
-      ADD(sfd, ev, K_DB, NULL, d);
-    }
-    for (size_t i = 0; i < nconns; i++) {
-      conn *c = conns[i];
-      if (c->st == READING || c->st == WRITING) ADD(c->fd, c->st == READING ? POLLIN : POLLOUT, K_CLIENT, c, NULL);
-      else if (c->st == RUNNING && c->dbst == DB_WAITLINE) ADD(c->reqfd, POLLIN, K_REQ, c, NULL);
-      else if (c->st == RUNNING && c->dbst == DB_RESP) ADD(c->respfd, POLLOUT, K_RESP, c, NULL);
-    }
-    int r = poll(pfds, np, any_down ? 50 : 1000);
-    if (r < 0 && errno != EINTR) die("poll");
-    if (r > 0) {
-      for (size_t i = 0; i < np; i++) {
-        short rev = pfds[i].revents;
-        if (!rev) continue;
-        conn *c = owner[i];
-        switch (kind[i]) {
-          case K_SELF: reap(); break;
-          case K_LISTEN: accept_on(pfds[i].fd); break;
-          case K_DB: if (downer[i]->st != D_DOWN && PQsocket(downer[i]->pg) == pfds[i].fd) dbc_event(downer[i], rev); break;
-          case K_REQ: if (c->st == RUNNING && c->dbst == DB_WAITLINE) db_read_line(c); break;
-          case K_RESP: if (c->st == RUNNING && c->dbst == DB_RESP) db_try_write(c); break;
-          default:
-            if (c->dead) break;
-            if (c->st == READING && (rev & (POLLIN | POLLHUP | POLLERR))) on_readable(c);
-            else if (c->st == WRITING && (rev & (POLLOUT | POLLERR | POLLHUP))) flush_out(c);
-            else if (rev & POLLNVAL) close_conn(c);
+  workers = calloc(nworkers, sizeof *workers); idle = calloc(nworkers, sizeof *idle);
+  for (int i = 0; i < nworkers; i++) {
+    worker *w = &workers[i]; w->id = i;
+    w->dsrc[0] = (evsrc){K_REQ, w}; w->dsrc[1] = (evsrc){K_RESP, w}; w->dsrc[2] = (evsrc){K_DONE, w};
+    w->reqfd = w->respfd = w->keepfd = -1; w->dbline = malloc(DBLINE);
+    size_t dl = strlen(workdir) + 16; w->dir = malloc(dl); snprintf(w->dir, dl, "%s/w%d", workdir, i);
+    spawn_worker(w);
+  }
+  evout evs[EVMAX]; time_t last_sweep = 0;
+  while (!stopping) {
+    int any_down = db_any_down();
+    for (int i = 0; i < nworkers; i++) if (workers[i].st == W_DOWN) any_down = 1;
+    int n = ev_wait(evs, any_down ? 50 : 1000);
+    for (int i = 0; i < n; i++) {
+      evsrc *src = evs[i].src; int rev = evs[i].ev;
+      switch (src->kind) {
+        case K_SELF: reap(); break;
+        case K_LISTEN: accept_on((int)(intptr_t)src->obj); break;
+        case K_DB: dbc_event(src->obj, rev); break;
+        case K_REQ: { worker *w = src->obj; if (w->st == W_BUSY && w->dbst == DB_WAITLINE) db_read_line(w); break; }
+        case K_RESP: { worker *w = src->obj; if (w->st == W_BUSY && w->dbst == DB_RESP) db_try_write(w); break; }
+        case K_DONE: on_done(src->obj); break;
+        default: {
+          conn *c = src->obj;
+          if (c->dead) break;
+          if (c->st == READING && (rev & (EV_IN | EV_ERR))) on_readable(c);
+          else if (c->st == WRITING && (rev & (EV_OUT | EV_ERR))) flush_out(c);
+          else if (rev & EV_ERR) close_conn(c);   /* reset while its request is queued or running */
         }
       }
     }
     db_dispatch();
     dispatch();
+    tick();
     time_t now = time(NULL);
-    for (size_t i = 0; i < nconns; i++) {
-      conn *c = conns[i];
-      if (c->st == READING && now - c->last > IDLE_SECS) close_conn(c);
-      else if (c->st == WRITING && now - c->last > IDLE_SECS) close_conn(c);
-      else if (c->st == RUNNING && now - c->started > CHILD_SECS) kill(c->pid, SIGKILL);
+    if (now != last_sweep) {                 /* idle connections: once a second is plenty */
+      last_sweep = now;
+      for (size_t i = 0; i < nconns; i++) {
+        conn *c = conns[i];
+        if ((c->st == READING || c->st == WRITING) && now - c->last > IDLE_SECS) { close_conn(c); i--; }
+      }
     }
-    compact();
+    empty_grave();
   }
+  shutdown_all();
+  return 0;
 }
