@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Foreground server. Env: DATABASE_URL, JWT_SECRET, HOST, PORT, EXTRA_PORT, [MAX_CHILDREN] (default 4 x cores).
+# Foreground server. Env: DATABASE_URL, JWT_SECRET, HOST, PORT, EXTRA_PORT, [MAX_CHILDREN] (default 4 x cores), [DB_POOL] (default min(2 x cores, 64)).
 set -euo pipefail
 cd "$(dirname "$0")"
 exec bin/host

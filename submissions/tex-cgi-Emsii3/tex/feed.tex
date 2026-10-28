@@ -2,7 +2,7 @@
 %
 % One pdftex process per request, started from a precompiled format (see build-fmt.tex).  The host has put
 % meta.txt / req.txt / body.txt in the current directory; \feedmain parses the request, verifies the JWT
-% (crypto: sha256.tex), parses the JSON body, runs one pgq command and writes resp.txt (status line, JSON line).
+% (crypto: sha256.tex), parses the JSON body, sends one database command through db.req / db.resp and writes resp.txt (status line, JSON line).
 %
 % Conventions:
 %  * Request data are strings of catcode-12 characters (spaces: catcode 10).
@@ -28,6 +28,7 @@
 \chardef\feed@fh=3
 \chardef\feed@pd=4
 \chardef\feed@wd=5
+\chardef\feed@qd=6
 
 \countdef\feed@c=200   \countdef\feed@d=201   \countdef\feed@cnt=202  \countdef\feed@i=203
 \countdef\feed@trim=204 \countdef\feed@pn=205 \countdef\feed@over=206 \countdef\feed@hi=207
@@ -375,7 +376,6 @@
   \feed@rdline \let\feed@now\feed@line
   \feed@rdline \let\feed@start\feed@line
   \feed@rdline \let\feed@secret\feed@line
-  \feed@rdline \let\feed@pgqpath\feed@line
   \closein\feed@fh}
 
 % request line:  METHOD SP target SP version
@@ -435,8 +435,10 @@
 % ---------------------------------------------------------------- pgq
 \def\feed@pgq#1{%
   \feed@got=0 \feed@lines=0 \relax
-  \edef\feed@cmd{|"\feed@pgqpath\space#1"}%
-  \openin\feed@pd=\feed@cmd\relax
+  \immediate\openout\feed@qd=db.req\relax
+  \immediate\write\feed@qd{#1}%
+  \immediate\closeout\feed@qd
+  \openin\feed@pd=db.resp\relax
   \feed@prloop
   \closein\feed@pd}
 \def\feed@fld#1|#2|#3|#4|#5|#6|#7\feed@end{%
