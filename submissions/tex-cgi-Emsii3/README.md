@@ -13,6 +13,16 @@ Shoutout to @IdkWhatToWriteHereOhManItWasAlreadyUsed and the CMake submission
 perfectly fine web framework. This one is directly inspired by it: same CGI-per-request idea, a different tool
 that was never meant for this.
 
+## Updates
+
+Each version is measured the same way (see "Measured": `ubuntu:24.04` container, 10 cores, `ab -k`, 8 s per run,
+concurrency 32, per-request directories on `/dev/shm`). Requests per second, p95 in brackets:
+
+| Version | Change | `GET /posts/1` | `GET /feed` | `POST /posts/2/like` |
+|---|---|---|---|---|
+| v1 | `pdftex` per request; TeX runs `sh` + a libpq CLI (`pgq`) through `-shell-escape`, a new Postgres connection per request | 529 (94 ms) | 437 (113 ms) | 213 (240 ms) |
+| v2 | pooled persistent libpq connections in the host; TeX talks to them through a FIFO pair (`db.req` / `db.resp`); no shell, no `pgq`, no `-shell-escape` | 1013 (28 ms) | 851 (31 ms) | 200 (173 ms) |
+
 ## Stack
 
 | Piece | Version |
