@@ -8,6 +8,11 @@ CGI script is a typesetting engine and it starts fresh for every single request.
 This is a joke with a working test suite (`test/run.sh`: `passed=42 failed=0`, golden files byte for byte). It
 is **not** going to hold a million users. See "Measured" for how far it does get.
 
+Shoutout to @IdkWhatToWriteHereOhManItWasAlreadyUsed and the CMake submission
+([#17](https://github.com/arjaythedev/million-users-challenge/pull/17)), which proved that a build system makes a
+perfectly fine web framework. This one is directly inspired by it: same CGI-per-request idea, a different tool
+that was never meant for this.
+
 ## Stack
 
 | Piece | Version |
